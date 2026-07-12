@@ -27,7 +27,14 @@ class CLIPVisionTower(nn.Module):
             return
 
         self.image_processor = CLIPImageProcessor.from_pretrained(self.vision_tower_name)
-        self.vision_tower = CLIPVisionModel.from_pretrained(self.vision_tower_name, device_map=device_map)
+        try:
+            self.vision_tower = CLIPVisionModel.from_pretrained(
+                self.vision_tower_name,
+                device_map=device_map,
+                attn_implementation="eager",
+            )
+        except TypeError:
+            self.vision_tower = CLIPVisionModel.from_pretrained(self.vision_tower_name, device_map=device_map)
         self.vision_tower.requires_grad_(False)
 
         self.is_loaded = True
@@ -42,6 +49,25 @@ class CLIPVisionTower(nn.Module):
             raise ValueError(f'Unexpected select feature: {self.select_feature}')
         return image_features
 
+    def _selected_attention_layer_index(self, image_forward_outs):
+        num_hidden_states = len(image_forward_outs.hidden_states)
+        hidden_index = self.select_layer
+        if hidden_index < 0:
+            hidden_index = num_hidden_states + hidden_index
+        return max(0, min(hidden_index - 1, len(image_forward_outs.attentions) - 1))
+
+    def attention_select(self, image_forward_outs):
+        attention_index = self._selected_attention_layer_index(image_forward_outs)
+        attentions = image_forward_outs.attentions[attention_index]
+        cls_attention = attentions[:, :, 0, :]
+        if self.select_feature == 'patch':
+            cls_attention = cls_attention[:, :, 1:]
+        elif self.select_feature == 'cls_patch':
+            cls_attention = cls_attention
+        else:
+            raise ValueError(f'Unexpected select feature: {self.select_feature}')
+        return cls_attention.mean(dim=1)
+
     @torch.no_grad()
     def forward(self, images):
         if type(images) is list:
@@ -55,6 +81,30 @@ class CLIPVisionTower(nn.Module):
             image_features = self.feature_select(image_forward_outs).to(images.dtype)
 
         return image_features
+
+    @torch.no_grad()
+    def forward_with_attention_scores(self, images):
+        if type(images) is list:
+            image_features = []
+            attention_scores = []
+            for image in images:
+                image_forward_out = self.vision_tower(
+                    image.to(device=self.device, dtype=self.dtype).unsqueeze(0),
+                    output_hidden_states=True,
+                    output_attentions=True,
+                )
+                image_features.append(self.feature_select(image_forward_out).to(image.dtype))
+                attention_scores.append(self.attention_select(image_forward_out).to(image.dtype))
+        else:
+            image_forward_outs = self.vision_tower(
+                images.to(device=self.device, dtype=self.dtype),
+                output_hidden_states=True,
+                output_attentions=True,
+            )
+            image_features = self.feature_select(image_forward_outs).to(images.dtype)
+            attention_scores = self.attention_select(image_forward_outs).to(images.dtype)
+
+        return image_features, attention_scores
 
     @property
     def dummy_feature(self):

@@ -138,9 +138,37 @@ class LlavaMetaForCausalLM(ABC):
         return self.get_model().get_vision_tower()
 
     def encode_images(self, images):
-        image_features = self.get_model().get_vision_tower()(images)
+        vision_tower = self.get_model().get_vision_tower()
+        dynamic_pruner = getattr(self.get_model(), "dynamic_pruner", None)
+        if dynamic_pruner is not None and hasattr(vision_tower, "forward_with_attention_scores"):
+            image_features, attention_scores = vision_tower.forward_with_attention_scores(images)
+            image_features = self.get_model().mm_projector(image_features)
+            return image_features, attention_scores
+
+        image_features = vision_tower(images)
         image_features = self.get_model().mm_projector(image_features)
         return image_features
+
+    def apply_dynamic_pruning(self, image_features, importance_scores=None):
+        dynamic_pruner = getattr(self.get_model(), "dynamic_pruner", None)
+        if dynamic_pruner is None:
+            return image_features
+
+        if isinstance(image_features, list):
+            pruned_features = []
+            aux_values = []
+            if importance_scores is None:
+                importance_scores = [None] * len(image_features)
+            for cur_features, cur_scores in zip(image_features, importance_scores):
+                cur_pruned, cur_aux = dynamic_pruner(cur_features, scores=cur_scores)
+                pruned_features.append(cur_pruned)
+                aux_values.append(cur_aux)
+            self.dynamic_pruning_aux = aux_values
+            return pruned_features
+
+        pruned_features, aux = dynamic_pruner(image_features, scores=importance_scores)
+        self.dynamic_pruning_aux = aux
+        return pruned_features
 
     def prepare_inputs_labels_for_multimodal(
         self, input_ids, position_ids, attention_mask, past_key_values, labels,
@@ -154,14 +182,25 @@ class LlavaMetaForCausalLM(ABC):
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
             concat_images = torch.cat([image for image in images], dim=0)
-            image_features = self.encode_images(concat_images)
+            encoded_images = self.encode_images(concat_images)
+            if isinstance(encoded_images, tuple):
+                image_features, importance_scores = encoded_images
+            else:
+                image_features, importance_scores = encoded_images, None
             split_sizes = [image.shape[0] for image in images]
             image_features = torch.split(image_features, split_sizes, dim=0)
+            if importance_scores is not None:
+                importance_scores = torch.split(importance_scores, split_sizes, dim=0)
             mm_patch_merge_type = getattr(self.config, 'mm_patch_merge_type', 'flat')
             image_aspect_ratio = getattr(self.config, 'image_aspect_ratio', 'square')
             if mm_patch_merge_type == 'flat':
                 image_features = [x.flatten(0, 1) for x in image_features]
+                if importance_scores is not None:
+                    importance_scores = [x.flatten(0, 1) for x in importance_scores]
             elif mm_patch_merge_type.startswith('spatial'):
+                if getattr(self.get_model(), "dynamic_pruner", None) is not None:
+                    raise NotImplementedError("Dynamic pruning with CLIP attention scores currently supports mm_patch_merge_type='flat' only.")
+                importance_scores = None
                 new_image_features = []
                 for image_idx, image_feature in enumerate(image_features):
                     if image_feature.shape[0] > 1:
@@ -199,7 +238,13 @@ class LlavaMetaForCausalLM(ABC):
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
-            image_features = self.encode_images(images)
+            encoded_images = self.encode_images(images)
+            if isinstance(encoded_images, tuple):
+                image_features, importance_scores = encoded_images
+            else:
+                image_features, importance_scores = encoded_images, None
+
+        image_features = self.apply_dynamic_pruning(image_features, importance_scores=importance_scores)
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):

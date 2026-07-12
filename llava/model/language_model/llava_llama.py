@@ -88,7 +88,7 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
                 image_sizes
             )
 
-        return super().forward(
+        outputs = super().forward(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -100,6 +100,20 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict
         )
+        dynamic_pruner = getattr(self.get_model(), "dynamic_pruner", None)
+        pruning_aux = getattr(self, "dynamic_pruning_aux", None)
+        if labels is not None and dynamic_pruner is not None and pruning_aux is not None:
+            if isinstance(pruning_aux, list):
+                budget_losses = [dynamic_pruner.budget_loss(aux) for aux in pruning_aux]
+                budget_loss = torch.stack(budget_losses).mean()
+            else:
+                budget_loss = dynamic_pruner.budget_loss(pruning_aux)
+            if return_dict is False:
+                loss = outputs[0] + budget_loss
+                outputs = (loss,) + outputs[1:]
+            elif outputs.loss is not None:
+                outputs.loss = outputs.loss + budget_loss
+        return outputs
 
     @torch.no_grad()
     def generate(
