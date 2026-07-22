@@ -59,7 +59,8 @@ class DynamicVisionTokenPruner(nn.Module):
         probs = scores_f.clamp_min(0)
         probs = probs / probs.sum(dim=-1, keepdim=True).clamp_min(1e-6)
         entropy = -(probs * probs.clamp_min(1e-6).log()).sum(dim=-1, keepdim=True)
-        quantiles = torch.quantile(scores_f, torch.tensor([0.25, 0.5, 0.75], device=scores.device), dim=-1).transpose(0, 1)
+        quantile_points = scores_f.new_tensor([0.25, 0.5, 0.75])
+        quantiles = torch.quantile(scores_f, quantile_points, dim=-1).transpose(0, 1)
         return torch.cat(
             [
                 scores_f.mean(dim=-1, keepdim=True),

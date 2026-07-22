@@ -2,11 +2,11 @@
 
 torch==2.1.2+cu121
 torchvision==0.16.2+cu121
-transformers==4.37.2
-tokenizers==0.15.1
+transformers==4.40.2
+tokenizers==0.19.1
 sentencepiece==0.1.99
 protobuf==4.25.3
-accelerate==0.21.0
+accelerate>=0.29.1
 peft==0.7.1
 bitsandbytes==0.43.1
 
@@ -16,9 +16,11 @@ Pillow==10.2.0
 packaging==23.2
 shortuuid==1.0.13
 requests==2.31.0
+chardet==5.2.0
 httpx==0.24.0
 pydantic==2.6.1
 markdown2[all]==2.4.12
+loguru==0.7.3
 
 einops==0.6.1
 einops-exts==0.0.4
