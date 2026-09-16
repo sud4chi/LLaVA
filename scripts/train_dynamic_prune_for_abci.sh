@@ -9,10 +9,15 @@
 
 set -euo pipefail
 
+DEFAULT_VISION_TOKEN_ROOT="/groups/gah51624/yasuda/vision_token"
+VISION_TOKEN_ROOT="${VISION_TOKEN_ROOT:-${DEFAULT_VISION_TOKEN_ROOT}}"
+
 # PBS runs a spool copy of this script, so BASH_SOURCE does not necessarily point
-# into the repository. Prefer PBS_O_WORKDIR when running as an ABCI batch job.
+# into the repository. Prefer the ABCI workspace path, then PBS_O_WORKDIR when
+# running as a batch job.
 if [[ -z "${LLAVA_ROOT:-}" ]]; then
   for root_candidate in \
+    "${VISION_TOKEN_ROOT}/LLaVA" \
     "${PBS_O_WORKDIR:-}" \
     "${PBS_O_WORKDIR:-}/LLaVA" \
     "${PBS_O_WORKDIR:-}/.." \
@@ -30,7 +35,7 @@ if [[ -z "${LLAVA_ROOT:-}" || ! -f "${LLAVA_ROOT}/llava/train/train_dynamic_prun
   exit 1
 fi
 
-WORKSPACE_ROOT="$(cd "${LLAVA_ROOT}/.." && pwd)"
+WORKSPACE_ROOT="$(cd "${VISION_TOKEN_ROOT}" 2>/dev/null || cd "${LLAVA_ROOT}/.." && pwd)"
 VENV_PATH="${VENV_PATH:-${LLAVA_ROOT}/.venv_dynamic_prune_local}"
 
 # ABCI's -k oe streams the PBS spool log to dynamic_prune.o<job-id> in the
@@ -61,6 +66,8 @@ if [[ ! -x "${VENV_PATH}/bin/python" ]]; then
   exit 1
 fi
 
+export PATH="${VENV_PATH}/bin:${PATH}"
+
 if [[ -f /etc/profile.d/modules.sh ]]; then
   # ABCI User Guide initializes Environment Modules from this file.
   # shellcheck disable=SC1091
@@ -76,7 +83,7 @@ fi
 export PYTHONNOUSERSITE=1
 export PYTHONUNBUFFERED=1
 export PYTHONPATH="${LLAVA_ROOT}:${PYTHONPATH:-}"
-export HF_HOME="${HF_HOME:-${LLAVA_ROOT}/.cache/huggingface}"
+export HF_HOME="${HF_HOME:-${WORKSPACE_ROOT}/.cache/huggingface}"
 export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-${HF_HOME}/hub}"
 export TRANSFORMERS_CACHE="${TRANSFORMERS_CACHE:-${HF_HOME}/transformers}"
 export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-${HF_HOME}/datasets}"
@@ -92,14 +99,14 @@ MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-liuhaotian/llava-v1.5-7b}"
 VISION_TOWER="${VISION_TOWER:-openai/clip-vit-large-patch14-336}"
 DATA_PATH="${DATA_PATH:-${WORKSPACE_ROOT}/D-prune_data/processed/llava/annotations/llava_instruct_150k_random10k.json}"
 IMAGE_FOLDER="${IMAGE_FOLDER:-${WORKSPACE_ROOT}/D-prune_data/raw/llava/coco/train2017}"
-OUTPUT_DIR="${OUTPUT_DIR:-${LLAVA_ROOT}/checkpoints/dynamic_dprune_attention_10k}"
+OUTPUT_DIR="${OUTPUT_DIR:-${LLAVA_ROOT}/checkpoints/score_core_frontier_10k}"
 
 [[ -f "${DATA_PATH}" ]] || { echo "DATA_PATH not found: ${DATA_PATH}" >&2; exit 1; }
 [[ -d "${IMAGE_FOLDER}" ]] || { echo "IMAGE_FOLDER not found: ${IMAGE_FOLDER}" >&2; exit 1; }
 mkdir -p "${OUTPUT_DIR}"
 
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"
-PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-4}"
+PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-1}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-4}"
 LEARNING_RATE="${LEARNING_RATE:-1e-4}"
 SAVE_STEPS="${SAVE_STEPS:-1000}"
@@ -107,10 +114,12 @@ LOGGING_STEPS="${LOGGING_STEPS:-10}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-4}"
 
-DYNAMIC_PRUNE_TARGET_KEEP_RATIO="${DYNAMIC_PRUNE_TARGET_KEEP_RATIO:-0.25}"
-DYNAMIC_PRUNE_MIN_KEEP="${DYNAMIC_PRUNE_MIN_KEEP:-64}"
-DYNAMIC_PRUNE_BUDGET_LOSS_WEIGHT="${DYNAMIC_PRUNE_BUDGET_LOSS_WEIGHT:-0.01}"
-DYNAMIC_PRUNE_TEMPERATURE="${DYNAMIC_PRUNE_TEMPERATURE:-0.1}"
+MIN_TOKENS="${MIN_TOKENS:-40}"
+MAX_TOKENS="${MAX_TOKENS:-80}"
+TARGET_AVG_TOKENS="${TARGET_AVG_TOKENS:-64}"
+VALIDATION_SPLIT_RATIO="${VALIDATION_SPLIT_RATIO:-0.05}"
+SCORE_ALPHA="${SCORE_ALPHA:-0.8}"
+UTILITY_HIDDEN_SIZE="${UTILITY_HIDDEN_SIZE:-128}"
 
 TRAIN_CMD=("${VENV_PATH}/bin/python" -m llava.train.train_dynamic_prune)
 if (( NPROC_PER_NODE > 1 )); then
@@ -127,6 +136,7 @@ nvidia-smi || true
   --model_name_or_path "${MODEL_NAME_OR_PATH}" \
   --version v1 \
   --data_path "${DATA_PATH}" \
+  --validation_split_ratio "${VALIDATION_SPLIT_RATIO}" \
   --image_folder "${IMAGE_FOLDER}" \
   --vision_tower "${VISION_TOWER}" \
   --mm_vision_select_layer -2 \
@@ -153,13 +163,13 @@ nvidia-smi || true
   --logging_first_step True \
   --tf32 True \
   --model_max_length 2048 \
-  --gradient_checkpointing True \
+  --gradient_checkpointing False \
   --dataloader_num_workers "${DATALOADER_NUM_WORKERS}" \
   --lazy_preprocess True \
   --report_to none \
-  --dynamic_prune_input_type scores \
-  --dynamic_prune_score_method attention \
-  --dynamic_prune_target_keep_ratio "${DYNAMIC_PRUNE_TARGET_KEEP_RATIO}" \
-  --dynamic_prune_min_keep "${DYNAMIC_PRUNE_MIN_KEEP}" \
-  --dynamic_prune_budget_loss_weight "${DYNAMIC_PRUNE_BUDGET_LOSS_WEIGHT}" \
-  --dynamic_prune_temperature "${DYNAMIC_PRUNE_TEMPERATURE}"
+  --score_method attention \
+  --score_alpha "${SCORE_ALPHA}" \
+  --utility_hidden_size "${UTILITY_HIDDEN_SIZE}" \
+  --min_tokens "${MIN_TOKENS}" \
+  --max_tokens "${MAX_TOKENS}" \
+  --target_avg_tokens "${TARGET_AVG_TOKENS}"

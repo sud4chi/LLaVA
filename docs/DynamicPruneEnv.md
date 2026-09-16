@@ -1,4 +1,4 @@
-# Dynamic Prune Environment
+# SCoRe Core--Frontier Dynamic Pruning
 
 This project should run dynamic-pruner training with a dedicated Python 3.10 virtualenv. The failed job `o.8079761` used `/usr/lib64/python3.9`, so it did not see the expected LLaVA dependencies. The existing `.venv_llava` also had `torch` but was missing packages such as `transformers`, and it contained NumPy 2.x, which is not appropriate for `torch==2.1.2`.
 
@@ -85,6 +85,35 @@ To use another environment, pass `VENV_PATH`:
 ```bash
 qsub -v VENV_PATH=/path/to/venv /gs/bs/hp190122/yasuda/vision_token/LLaVA/scripts/train_dynamic_prune.sh
 ```
+
+The default token budget is `min_tokens=40`, `max_tokens=80`, and
+`target_avg_tokens=64`. Override it through environment variables passed to
+the job script:
+
+```bash
+qsub -v MIN_TOKENS=40,MAX_TOKENS=80,TARGET_AVG_TOKENS=64 \
+  /gs/bs/hp190122/yasuda/vision_token/LLaVA/scripts/train_dynamic_prune.sh
+```
+
+By default, a deterministic 5% split of `DATA_PATH` is reserved for threshold
+calibration. To use a separate validation annotation file, invoke the Python
+entry point directly with `--validation_data_path /path/to/validation.json`.
+After utility-predictor training, the script selects one global strict-`>`
+threshold whose dataset-wide average retained-token count is closest to
+`target_avg_tokens`. The threshold is stored in
+`dynamic_pruner_config.json` alongside `dynamic_pruner.bin`.
+
+Each training sample produces one core-only sequence and one sequence for each
+frontier candidate. These sequences are packed into a single LLM forward; the
+vision encoder, projector, SCoRe ranking, and LLM are therefore each invoked
+only once per sample/batch. This expands the effective LLM batch by
+`1 + max_tokens - min_tokens`, so the job scripts default to a physical batch
+size of one.
+
+For inference, use the predictor checkpoint as `model_path` and the original
+LLaVA checkpoint as `model_base` with `load_pretrained_model`. The loader
+automatically attaches the utility predictor and restores its calibrated
+threshold.
 
 ## Notes
 

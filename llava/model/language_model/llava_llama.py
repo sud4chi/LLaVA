@@ -17,6 +17,7 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from transformers import AutoConfig, AutoModelForCausalLM, \
                          LlamaConfig, LlamaModel, LlamaForCausalLM
@@ -25,6 +26,7 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.generation.utils import GenerateOutput
 
 from ..llava_arch import LlavaMetaModel, LlavaMetaForCausalLM
+from ..dynamic_pruning import core_frontier_utility_targets
 
 
 class LlavaConfig(LlamaConfig):
@@ -71,6 +73,78 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
         cache_position: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
 
+        dynamic_pruner = getattr(self.get_model(), "dynamic_pruner", None)
+        utility_teacher_mode = (
+            inputs_embeds is None
+            and labels is not None
+            and images is not None
+            and dynamic_pruner is not None
+            and dynamic_pruner.training
+        )
+        if utility_teacher_mode:
+            teacher_batch = self.prepare_core_frontier_teacher_batch(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                images=images,
+            )
+            # All core-only and core+one-frontier variants are packed into this
+            # single LLM invocation.  The frozen teacher never builds a graph.
+            with torch.no_grad():
+                teacher_outputs = self.model(
+                    input_ids=None,
+                    attention_mask=teacher_batch["attention_mask"],
+                    position_ids=teacher_batch["position_ids"],
+                    past_key_values=None,
+                    inputs_embeds=teacher_batch["inputs_embeds"],
+                    use_cache=False,
+                    output_attentions=False,
+                    output_hidden_states=False,
+                    return_dict=True,
+                    cache_position=cache_position,
+                )
+                shift_labels = teacher_batch["labels"][:, 1:]
+                valid_labels = shift_labels.ne(-100)
+                answer_token_counts = valid_labels.sum(dim=-1)
+                if torch.any(answer_token_counts == 0):
+                    raise ValueError("Every utility teacher variant must contain at least one answer label")
+
+                # Project only answer-predicting hidden states through the LM
+                # head.  This is numerically equivalent to materializing full
+                # [variant, sequence, vocabulary] logits, but avoids a very
+                # large tensor for ignored prompt/image positions.
+                answer_hidden = teacher_outputs.last_hidden_state[:, :-1][valid_labels]
+                answer_targets = shift_labels[valid_labels]
+                if self.config.pretraining_tp > 1:
+                    lm_head_slices = self.lm_head.weight.split(
+                        self.vocab_size // self.config.pretraining_tp,
+                        dim=0,
+                    )
+                    answer_logits = torch.cat(
+                        [F.linear(answer_hidden, weight) for weight in lm_head_slices],
+                        dim=-1,
+                    )
+                else:
+                    answer_logits = self.lm_head(answer_hidden)
+                answer_ce = F.cross_entropy(answer_logits.float(), answer_targets, reduction="none")
+                variant_indices = torch.where(valid_labels)[0]
+                variant_ce_sums = answer_ce.new_zeros(shift_labels.shape[0])
+                variant_ce_sums.scatter_add_(0, variant_indices, answer_ce)
+                variant_mean_ce = variant_ce_sums / answer_token_counts
+                utility_targets = core_frontier_utility_targets(
+                    variant_mean_ce,
+                    teacher_batch["core_variant_for_candidate"],
+                    teacher_batch["candidate_variant_indices"],
+                )
+
+            utility_loss = dynamic_pruner.utility_loss(
+                teacher_batch["predicted_utilities"],
+                utility_targets,
+            )
+            if return_dict is False:
+                return (utility_loss,)
+            return CausalLMOutputWithPast(loss=utility_loss, logits=None)
+
         if inputs_embeds is None:
             (
                 input_ids,
@@ -102,19 +176,6 @@ class LlavaLlamaForCausalLM(LlamaForCausalLM, LlavaMetaForCausalLM):
             return_dict=return_dict,
             cache_position=cache_position,
         )
-        dynamic_pruner = getattr(self.get_model(), "dynamic_pruner", None)
-        pruning_aux = getattr(self, "dynamic_pruning_aux", None)
-        if labels is not None and dynamic_pruner is not None and pruning_aux is not None:
-            if isinstance(pruning_aux, list):
-                budget_losses = [dynamic_pruner.budget_loss(aux) for aux in pruning_aux]
-                budget_loss = torch.stack(budget_losses).mean()
-            else:
-                budget_loss = dynamic_pruner.budget_loss(pruning_aux)
-            if return_dict is False:
-                loss = outputs[0] + budget_loss
-                outputs = (loss,) + outputs[1:]
-            elif outputs.loss is not None:
-                outputs.loss = outputs.loss + budget_loss
         return outputs
 
     @torch.no_grad()

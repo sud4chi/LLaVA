@@ -42,20 +42,22 @@ MODEL_NAME_OR_PATH="${MODEL_NAME_OR_PATH:-liuhaotian/llava-v1.5-7b}"
 VISION_TOWER="${VISION_TOWER:-openai/clip-vit-large-patch14-336}"
 DATA_PATH="${DATA_PATH:-/home/2/ut05192/hp_bs/datasets/D-prune_data/processed/llava/annotations/llava_instruct_150k_random10k.json}"
 IMAGE_FOLDER="${IMAGE_FOLDER:-/home/2/ut05192/hp_bs/datasets/D-prune_data/raw/llava/coco/train2017}"
-OUTPUT_DIR="${OUTPUT_DIR:-${LLAVA_ROOT}/checkpoints/dynamic_dprune_attention_10k}"
+OUTPUT_DIR="${OUTPUT_DIR:-${LLAVA_ROOT}/checkpoints/score_core_frontier_10k}"
 mkdir -p "${OUTPUT_DIR}"
 
 NUM_TRAIN_EPOCHS="${NUM_TRAIN_EPOCHS:-1}"
-PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-4}"
+PER_DEVICE_TRAIN_BATCH_SIZE="${PER_DEVICE_TRAIN_BATCH_SIZE:-1}"
 GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-4}"
 LEARNING_RATE="${LEARNING_RATE:-1e-4}"
 SAVE_STEPS="${SAVE_STEPS:-1000}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
 
-DYNAMIC_PRUNE_TARGET_KEEP_RATIO="${DYNAMIC_PRUNE_TARGET_KEEP_RATIO:-0.25}"
-DYNAMIC_PRUNE_MIN_KEEP="${DYNAMIC_PRUNE_MIN_KEEP:-64}"
-DYNAMIC_PRUNE_BUDGET_LOSS_WEIGHT="${DYNAMIC_PRUNE_BUDGET_LOSS_WEIGHT:-0.01}"
-DYNAMIC_PRUNE_TEMPERATURE="${DYNAMIC_PRUNE_TEMPERATURE:-0.1}"
+MIN_TOKENS="${MIN_TOKENS:-40}"
+MAX_TOKENS="${MAX_TOKENS:-80}"
+TARGET_AVG_TOKENS="${TARGET_AVG_TOKENS:-64}"
+VALIDATION_SPLIT_RATIO="${VALIDATION_SPLIT_RATIO:-0.05}"
+SCORE_ALPHA="${SCORE_ALPHA:-0.8}"
+UTILITY_HIDDEN_SIZE="${UTILITY_HIDDEN_SIZE:-128}"
 
 TRAIN_CMD="python -m llava.train.train_dynamic_prune"
 if [ "${NPROC_PER_NODE}" -gt 1 ]; then
@@ -66,6 +68,7 @@ ${TRAIN_CMD} \
   --model_name_or_path "${MODEL_NAME_OR_PATH}" \
   --version v1 \
   --data_path "${DATA_PATH}" \
+  --validation_split_ratio "${VALIDATION_SPLIT_RATIO}" \
   --image_folder "${IMAGE_FOLDER}" \
   --vision_tower "${VISION_TOWER}" \
   --mm_vision_select_layer -2 \
@@ -90,13 +93,13 @@ ${TRAIN_CMD} \
   --logging_steps 10 \
   --tf32 True \
   --model_max_length 2048 \
-  --gradient_checkpointing True \
+  --gradient_checkpointing False \
   --dataloader_num_workers 4 \
   --lazy_preprocess True \
   --report_to none \
-  --dynamic_prune_input_type scores \
-  --dynamic_prune_score_method attention \
-  --dynamic_prune_target_keep_ratio "${DYNAMIC_PRUNE_TARGET_KEEP_RATIO}" \
-  --dynamic_prune_min_keep "${DYNAMIC_PRUNE_MIN_KEEP}" \
-  --dynamic_prune_budget_loss_weight "${DYNAMIC_PRUNE_BUDGET_LOSS_WEIGHT}" \
-  --dynamic_prune_temperature "${DYNAMIC_PRUNE_TEMPERATURE}"
+  --score_method attention \
+  --score_alpha "${SCORE_ALPHA}" \
+  --utility_hidden_size "${UTILITY_HIDDEN_SIZE}" \
+  --min_tokens "${MIN_TOKENS}" \
+  --max_tokens "${MAX_TOKENS}" \
+  --target_avg_tokens "${TARGET_AVG_TOKENS}"

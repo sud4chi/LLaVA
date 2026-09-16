@@ -139,17 +139,31 @@ class LlavaMetaForCausalLM(ABC):
 
     def encode_images(self, images):
         vision_tower = self.get_model().get_vision_tower()
-        dynamic_pruner = getattr(self.get_model(), "dynamic_pruner", None)
-        if dynamic_pruner is not None and hasattr(vision_tower, "forward_with_attention_scores"):
-            image_features, attention_scores = vision_tower.forward_with_attention_scores(images)
-            image_features = self.get_model().mm_projector(image_features)
-            return image_features, attention_scores
-
         image_features = vision_tower(images)
         image_features = self.get_model().mm_projector(image_features)
         return image_features
 
-    def apply_dynamic_pruning(self, image_features, importance_scores=None):
+    def encode_images_for_dynamic_pruning(self, images):
+        """Run vision encoder/projector once and retain both feature spaces."""
+        vision_tower = self.get_model().get_vision_tower()
+        if hasattr(vision_tower, "forward_with_attention_scores"):
+            ranking_features, attention_scores = vision_tower.forward_with_attention_scores(images)
+        else:
+            ranking_features = vision_tower(images)
+            attention_scores = None
+        projector = self.get_model().mm_projector
+        try:
+            projector_parameter = next(projector.parameters())
+            projector_inputs = ranking_features.to(
+                device=projector_parameter.device,
+                dtype=projector_parameter.dtype,
+            )
+        except StopIteration:
+            projector_inputs = ranking_features
+        projected_features = projector(projector_inputs)
+        return projected_features, ranking_features, attention_scores
+
+    def apply_dynamic_pruning(self, image_features, ranking_features=None, importance_scores=None):
         dynamic_pruner = getattr(self.get_model(), "dynamic_pruner", None)
         if dynamic_pruner is None:
             return image_features
@@ -157,16 +171,49 @@ class LlavaMetaForCausalLM(ABC):
         if isinstance(image_features, list):
             pruned_features = []
             aux_values = []
+            if ranking_features is None:
+                ranking_features = image_features
             if importance_scores is None:
                 importance_scores = [None] * len(image_features)
-            for cur_features, cur_scores in zip(image_features, importance_scores):
-                cur_pruned, cur_aux = dynamic_pruner(cur_features, scores=cur_scores)
+            for cur_features, cur_ranking_features, cur_scores in zip(
+                image_features, ranking_features, importance_scores
+            ):
+                cur_pruned, cur_aux = dynamic_pruner(
+                    cur_features,
+                    ranking_tokens=cur_ranking_features,
+                    scores=cur_scores,
+                )
                 pruned_features.append(cur_pruned)
                 aux_values.append(cur_aux)
             self.dynamic_pruning_aux = aux_values
             return pruned_features
 
-        pruned_features, aux = dynamic_pruner(image_features, scores=importance_scores)
+        if image_features.ndim == 3:
+            ranking_features = image_features if ranking_features is None else ranking_features
+            scores_per_sample = importance_scores
+            if scores_per_sample is None:
+                scores_per_sample = [None] * image_features.shape[0]
+            outputs = []
+            aux_values = []
+            for cur_features, cur_ranking_features, cur_scores in zip(
+                image_features, ranking_features, scores_per_sample
+            ):
+                cur_pruned, cur_aux = dynamic_pruner(
+                    cur_features,
+                    ranking_tokens=cur_ranking_features,
+                    scores=cur_scores,
+                )
+                outputs.append(cur_pruned)
+                aux_values.append(cur_aux)
+            self.dynamic_pruning_aux = aux_values
+            return outputs
+
+        ranking_features = image_features if ranking_features is None else ranking_features
+        pruned_features, aux = dynamic_pruner(
+            image_features,
+            ranking_tokens=ranking_features,
+            scores=importance_scores,
+        )
         self.dynamic_pruning_aux = aux
         return pruned_features
 
@@ -182,24 +229,29 @@ class LlavaMetaForCausalLM(ABC):
             if type(images) is list:
                 images = [x.unsqueeze(0) if x.ndim == 3 else x for x in images]
             concat_images = torch.cat([image for image in images], dim=0)
-            encoded_images = self.encode_images(concat_images)
-            if isinstance(encoded_images, tuple):
-                image_features, importance_scores = encoded_images
+            if getattr(self.get_model(), "dynamic_pruner", None) is not None:
+                image_features, ranking_features, importance_scores = self.encode_images_for_dynamic_pruning(concat_images)
             else:
-                image_features, importance_scores = encoded_images, None
+                image_features = self.encode_images(concat_images)
+                ranking_features, importance_scores = None, None
             split_sizes = [image.shape[0] for image in images]
             image_features = torch.split(image_features, split_sizes, dim=0)
+            if ranking_features is not None:
+                ranking_features = torch.split(ranking_features, split_sizes, dim=0)
             if importance_scores is not None:
                 importance_scores = torch.split(importance_scores, split_sizes, dim=0)
             mm_patch_merge_type = getattr(self.config, 'mm_patch_merge_type', 'flat')
             image_aspect_ratio = getattr(self.config, 'image_aspect_ratio', 'square')
             if mm_patch_merge_type == 'flat':
                 image_features = [x.flatten(0, 1) for x in image_features]
+                if ranking_features is not None:
+                    ranking_features = [x.flatten(0, 1) for x in ranking_features]
                 if importance_scores is not None:
                     importance_scores = [x.flatten(0, 1) for x in importance_scores]
             elif mm_patch_merge_type.startswith('spatial'):
                 if getattr(self.get_model(), "dynamic_pruner", None) is not None:
                     raise NotImplementedError("Dynamic pruning with CLIP attention scores currently supports mm_patch_merge_type='flat' only.")
+                ranking_features = None
                 importance_scores = None
                 new_image_features = []
                 for image_idx, image_feature in enumerate(image_features):
@@ -238,13 +290,37 @@ class LlavaMetaForCausalLM(ABC):
             else:
                 raise ValueError(f"Unexpected mm_patch_merge_type: {self.config.mm_patch_merge_type}")
         else:
-            encoded_images = self.encode_images(images)
-            if isinstance(encoded_images, tuple):
-                image_features, importance_scores = encoded_images
+            if getattr(self.get_model(), "dynamic_pruner", None) is not None:
+                image_features, ranking_features, importance_scores = self.encode_images_for_dynamic_pruning(images)
             else:
-                image_features, importance_scores = encoded_images, None
+                image_features = self.encode_images(images)
+                ranking_features, importance_scores = None, None
 
-        image_features = self.apply_dynamic_pruning(image_features, importance_scores=importance_scores)
+        image_features = self.apply_dynamic_pruning(
+            image_features,
+            ranking_features=ranking_features,
+            importance_scores=importance_scores,
+        )
+
+        return self._prepare_multimodal_embeddings_from_features(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            labels=labels,
+            image_features=image_features,
+        )
+
+    def _prepare_multimodal_embeddings_from_features(
+        self,
+        input_ids,
+        position_ids,
+        attention_mask,
+        past_key_values,
+        labels,
+        image_features,
+    ):
+        """Insert precomputed image embeddings into text sequences."""
 
         # TODO: image start / end is not implemented here to support pretraining.
         if getattr(self.config, 'tune_mm_mlp_adapter', False) and getattr(self.config, 'mm_use_im_start_end', False):
@@ -367,6 +443,137 @@ class LlavaMetaForCausalLM(ABC):
             position_ids = None
 
         return None, position_ids, attention_mask, past_key_values, new_input_embeds, new_labels
+
+    def prepare_core_frontier_teacher_batch(
+        self,
+        input_ids,
+        attention_mask,
+        labels,
+        images,
+    ):
+        """Build all core/candidate variants while encoding each image once."""
+        dynamic_pruner = getattr(self.get_model(), "dynamic_pruner", None)
+        if dynamic_pruner is None:
+            raise ValueError("Core--Frontier teacher generation requires an attached dynamic_pruner")
+        if labels is None:
+            raise ValueError("Core--Frontier teacher generation requires answer labels")
+        if not torch.is_tensor(images) or images.ndim != 4:
+            raise NotImplementedError(
+                "Core--Frontier utility training currently requires one equally-sized image per sample"
+            )
+        if images.shape[0] != input_ids.shape[0]:
+            raise ValueError("image and text batch sizes must match")
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids, dtype=torch.bool)
+
+        # Vision encoder and projector are frozen.  The output tensors are
+        # reused by all 1 + |frontier| variants for a sample.
+        with torch.no_grad():
+            projected_features, ranking_features, importance_scores = self.encode_images_for_dynamic_pruning(images)
+
+        expanded_input_ids = []
+        expanded_attention_mask = []
+        expanded_labels = []
+        variant_image_features = []
+        predicted_utilities = []
+        core_variant_for_candidate = []
+        candidate_variant_indices = []
+        analyses = []
+
+        for sample_index in range(input_ids.shape[0]):
+            valid_ids = input_ids[sample_index][attention_mask[sample_index].bool()]
+            if int((valid_ids == IMAGE_TOKEN_INDEX).sum().item()) != 1:
+                raise NotImplementedError(
+                    "Core--Frontier utility training currently supports exactly one image token per sample"
+                )
+
+            sample_scores = None if importance_scores is None else importance_scores[sample_index]
+            analysis = dynamic_pruner.analyze_sample(
+                projected_features[sample_index],
+                ranking_features[sample_index],
+                scores=sample_scores,
+            )
+            core_indices = analysis["core_indices"]
+            frontier_indices = analysis["frontier_indices"]
+            if frontier_indices.numel() == 0:
+                raise ValueError(
+                    "No frontier tokens are available; max_tokens must exceed min_tokens and the encoder must provide enough tokens"
+                )
+
+            core_variant_index = len(variant_image_features)
+            core_spatial_indices = core_indices.sort().values
+            variant_image_features.append(
+                projected_features[sample_index].index_select(0, core_spatial_indices)
+            )
+            expanded_input_ids.append(input_ids[sample_index])
+            expanded_attention_mask.append(attention_mask[sample_index])
+            expanded_labels.append(labels[sample_index])
+
+            for frontier_index in frontier_indices:
+                selected_indices = torch.cat([core_indices, frontier_index.view(1)]).sort().values
+                candidate_variant_indices.append(len(variant_image_features))
+                core_variant_for_candidate.append(core_variant_index)
+                variant_image_features.append(
+                    projected_features[sample_index].index_select(0, selected_indices)
+                )
+                expanded_input_ids.append(input_ids[sample_index])
+                expanded_attention_mask.append(attention_mask[sample_index])
+                expanded_labels.append(labels[sample_index])
+
+            predicted_utilities.append(analysis["predicted_utilities"])
+            analyses.append(analysis)
+
+        expanded_input_ids = torch.stack(expanded_input_ids)
+        expanded_attention_mask = torch.stack(expanded_attention_mask)
+        expanded_labels = torch.stack(expanded_labels)
+        prepared = self._prepare_multimodal_embeddings_from_features(
+            input_ids=expanded_input_ids,
+            position_ids=None,
+            attention_mask=expanded_attention_mask,
+            past_key_values=None,
+            labels=expanded_labels,
+            image_features=variant_image_features,
+        )
+        return {
+            "position_ids": prepared[1],
+            "attention_mask": prepared[2],
+            "inputs_embeds": prepared[4],
+            "labels": prepared[5],
+            "predicted_utilities": torch.cat(predicted_utilities),
+            "core_variant_for_candidate": torch.tensor(
+                core_variant_for_candidate,
+                device=expanded_input_ids.device,
+                dtype=torch.long,
+            ),
+            "candidate_variant_indices": torch.tensor(
+                candidate_variant_indices,
+                device=expanded_input_ids.device,
+                dtype=torch.long,
+            ),
+            "analyses": analyses,
+        }
+
+    @torch.no_grad()
+    def predict_core_frontier_utilities(self, images):
+        """Run the calibration/inference feature path without invoking the LLM."""
+        dynamic_pruner = getattr(self.get_model(), "dynamic_pruner", None)
+        if dynamic_pruner is None:
+            raise ValueError("threshold calibration requires an attached dynamic_pruner")
+        if not torch.is_tensor(images) or images.ndim != 4:
+            raise NotImplementedError("threshold calibration requires a batch of equally-sized images")
+
+        projected_features, ranking_features, importance_scores = self.encode_images_for_dynamic_pruning(images)
+        analyses = []
+        for sample_index in range(images.shape[0]):
+            sample_scores = None if importance_scores is None else importance_scores[sample_index]
+            analyses.append(
+                dynamic_pruner.analyze_sample(
+                    projected_features[sample_index],
+                    ranking_features[sample_index],
+                    scores=sample_scores,
+                )
+            )
+        return analyses
 
     def initialize_vision_tokenizer(self, model_args, tokenizer):
         if model_args.mm_use_im_patch_token:

@@ -32,7 +32,12 @@ def select_visual_token_indices(
     target_size: int,
     alpha: float = 1.0,
 ) -> torch.Tensor:
-    """Select visual-token indices with salience-coverage reduction."""
+    """Return the SCoRe greedy ranking up to ``target_size`` tokens.
+
+    SCoRe starts from the most salient token and repeatedly maximizes
+    ``min_cosine_distance_to_selected * salience ** alpha``.  The returned
+    order is the ranking/selection order, not the original spatial order.
+    """
     if target_size <= 0:
         raise ValueError(f"target_size must be positive, got {target_size}")
     if alpha < 0:
@@ -41,9 +46,14 @@ def select_visual_token_indices(
     visual_tokens, was_unbatched = _as_batched_visual_tokens(visual_tokens)
     batch_size, num_tokens, _ = visual_tokens.shape
     keep_count = min(target_size, num_tokens)
-    scores = _as_batched_scores(scores, batch_size, num_tokens).to(device=visual_tokens.device, dtype=visual_tokens.dtype)
+    scores = _as_batched_scores(scores, batch_size, num_tokens).to(
+        device=visual_tokens.device,
+        dtype=torch.float32,
+    )
 
-    normalized_tokens = F.normalize(visual_tokens, p=2, dim=-1)
+    # Do the distance calculation in fp32.  fp16 cosine similarities around
+    # one otherwise make the coverage term unnecessarily unstable.
+    normalized_tokens = F.normalize(visual_tokens.float(), p=2, dim=-1)
     selected_indices = torch.empty(batch_size, keep_count, device=visual_tokens.device, dtype=torch.long)
     selected_mask = torch.zeros(batch_size, num_tokens, device=visual_tokens.device, dtype=torch.bool)
 
@@ -78,6 +88,42 @@ def select_visual_token_indices(
     return selected_indices
 
 
+def split_core_frontier_indices(
+    ranking: torch.Tensor,
+    min_tokens: int,
+    max_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Split an SCoRe ranking into mandatory core and candidate frontier."""
+    if min_tokens <= 0:
+        raise ValueError(f"min_tokens must be positive, got {min_tokens}")
+    if max_tokens < min_tokens:
+        raise ValueError(f"max_tokens ({max_tokens}) must be >= min_tokens ({min_tokens})")
+    if ranking.ndim not in {1, 2}:
+        raise ValueError(f"ranking must be [tokens] or [batch, tokens], got {tuple(ranking.shape)}")
+
+    available = ranking.shape[-1]
+    core_end = min(min_tokens, available)
+    frontier_end = min(max_tokens, available)
+    return ranking[..., :core_end], ranking[..., core_end:frontier_end]
+
+
+def gather_tokens_in_original_order(
+    visual_tokens: torch.Tensor,
+    selected_indices: torch.Tensor,
+) -> torch.Tensor:
+    """Gather selected tokens while retaining their original spatial order."""
+    sorted_indices = selected_indices.sort(dim=-1).values
+    if visual_tokens.ndim == 2:
+        if sorted_indices.ndim != 1:
+            raise ValueError("unbatched visual_tokens require one-dimensional selected_indices")
+        return visual_tokens.index_select(0, sorted_indices)
+    if visual_tokens.ndim == 3:
+        if sorted_indices.ndim != 2 or sorted_indices.shape[0] != visual_tokens.shape[0]:
+            raise ValueError("batched visual_tokens and selected_indices must have matching batch dimensions")
+        return visual_tokens.gather(1, sorted_indices.unsqueeze(-1).expand(-1, -1, visual_tokens.shape[-1]))
+    raise ValueError(f"visual_tokens must be [tokens, dim] or [batch, tokens, dim], got {tuple(visual_tokens.shape)}")
+
+
 def hard_prune_by_keep_count(
     visual_tokens: torch.Tensor,
     scores: torch.Tensor,
@@ -85,9 +131,7 @@ def hard_prune_by_keep_count(
     alpha: float = 1.0,
 ) -> torch.Tensor:
     keep_indices = select_visual_token_indices(visual_tokens, scores, keep_count, alpha=alpha)
-    if visual_tokens.ndim == 2:
-        return visual_tokens.gather(0, keep_indices.unsqueeze(-1).expand(-1, visual_tokens.shape[-1]))
-    return visual_tokens.gather(1, keep_indices.unsqueeze(-1).expand(-1, -1, visual_tokens.shape[-1]))
+    return gather_tokens_in_original_order(visual_tokens, keep_indices)
 
 
 def keep_count_from_ratio(num_tokens: int, keep_ratio: torch.Tensor | float, min_keep: int, max_keep: int | None = None) -> int:

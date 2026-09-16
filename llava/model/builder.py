@@ -25,6 +25,9 @@ from llava.constants import DEFAULT_IMAGE_PATCH_TOKEN, DEFAULT_IM_START_TOKEN, D
 
 def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, load_4bit=False, device_map="auto", device="cuda", use_flash_attn=False, **kwargs):
     kwargs = {"device_map": device_map, **kwargs}
+    is_llava_model = 'llava' in model_name.lower() or os.path.isfile(
+        os.path.join(model_path, 'dynamic_pruner.bin')
+    )
 
     if device != "cuda":
         kwargs['device_map'] = {"": device}
@@ -45,7 +48,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
     if use_flash_attn:
         kwargs['attn_implementation'] = 'flash_attention_2'
 
-    if 'llava' in model_name.lower():
+    if is_llava_model:
         # Load LLaVA model
         if 'lora' in model_name.lower() and model_base is None:
             warnings.warn('There is `lora` in model name but no `model_base` is provided. If you are loading a LoRA model, please provide the `model_base` argument. Detailed instruction: https://github.com/haotian-liu/LLaVA#launch-a-model-worker-lora-weights-unmerged.')
@@ -85,7 +88,8 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
             model = model.merge_and_unload()
             print('Model is loaded...')
         elif model_base is not None:
-            # this may be mm projector only
+            # This may be an mm-projector adapter or a Core--Frontier pruner
+            # checkpoint layered on a complete LLaVA base model.
             print('Loading LLaVA from base model...')
             if 'mpt' in model_name.lower():
                 if not os.path.isfile(os.path.join(model_path, 'configuration_mpt.py')):
@@ -98,9 +102,15 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
                 cfg_pretrained = AutoConfig.from_pretrained(model_path)
                 model = LlavaLlamaForCausalLM.from_pretrained(model_base, low_cpu_mem_usage=True, config=cfg_pretrained, **kwargs)
 
-            mm_projector_weights = torch.load(os.path.join(model_path, 'mm_projector.bin'), map_location='cpu')
-            mm_projector_weights = {k: v.to(torch.float16) for k, v in mm_projector_weights.items()}
-            model.load_state_dict(mm_projector_weights, strict=False)
+            mm_projector_path = os.path.join(model_path, 'mm_projector.bin')
+            if os.path.isfile(mm_projector_path):
+                mm_projector_weights = torch.load(mm_projector_path, map_location='cpu')
+                mm_projector_weights = {k: v.to(torch.float16) for k, v in mm_projector_weights.items()}
+                model.load_state_dict(mm_projector_weights, strict=False)
+            elif not os.path.isfile(os.path.join(model_path, 'dynamic_pruner.bin')):
+                raise FileNotFoundError(
+                    f"Neither mm_projector.bin nor dynamic_pruner.bin exists in {model_path}"
+                )
         else:
             if 'mpt' in model_name.lower():
                 tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=True)
@@ -143,7 +153,7 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
 
     image_processor = None
 
-    if 'llava' in model_name.lower():
+    if is_llava_model:
         mm_use_im_start_end = getattr(model.config, "mm_use_im_start_end", False)
         mm_use_im_patch_token = getattr(model.config, "mm_use_im_patch_token", True)
         if mm_use_im_patch_token:
@@ -158,6 +168,14 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
         if device_map != 'auto':
             vision_tower.to(device=device_map, dtype=torch.float16)
         image_processor = vision_tower.image_processor
+
+        dynamic_pruner_path = os.path.join(model_path, 'dynamic_pruner.bin')
+        if os.path.isfile(dynamic_pruner_path):
+            from llava.model.dynamic_pruning import load_dynamic_pruner
+
+            print('Loading SCoRe Core--Frontier utility predictor...')
+            load_dynamic_pruner(model, model_path)
+            model.eval()
 
     if hasattr(model.config, "max_sequence_length"):
         context_len = model.config.max_sequence_length

@@ -28,6 +28,9 @@ def attach_dynamic_pruner(
 
     pruner = DynamicVisionTokenPruner(vision_hidden_size=vision_hidden_size, config=config)
     if checkpoint_path is not None:
+        checkpoint_path = Path(checkpoint_path)
+        if checkpoint_path.is_dir():
+            checkpoint_path = checkpoint_path / "dynamic_pruner.bin"
         state = torch.load(checkpoint_path, map_location="cpu")
         if "state_dict" in state:
             state = state["state_dict"]
@@ -65,6 +68,8 @@ def save_dynamic_pruner(model, output_dir: str) -> None:
     torch.save({"state_dict": pruner.state_dict()}, output_path / "dynamic_pruner.bin")
     with open(output_path / "dynamic_pruner_config.json", "w", encoding="utf-8") as f:
         json.dump(pruner.config.to_dict(), f, indent=2, sort_keys=True)
+    model.config.use_dynamic_pruning = True
+    model.config.dynamic_pruning_config = pruner.config.to_dict()
     model.config.save_pretrained(output_path)
 
 

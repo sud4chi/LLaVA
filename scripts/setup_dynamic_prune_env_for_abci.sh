@@ -2,9 +2,13 @@
 
 set -euo pipefail
 
-LLAVA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WORKSPACE_ROOT="$(cd "${LLAVA_ROOT}/.." && pwd)"
+DEFAULT_VISION_TOKEN_ROOT="/groups/gah51624/yasuda/vision_token"
+WORKSPACE_ROOT="${VISION_TOKEN_ROOT:-${DEFAULT_VISION_TOKEN_ROOT}}"
+WORKSPACE_ROOT="$(cd "${WORKSPACE_ROOT}" && pwd)"
+LLAVA_ROOT="${LLAVA_ROOT:-${WORKSPACE_ROOT}/LLaVA}"
+LLAVA_ROOT="$(cd "${LLAVA_ROOT}" && pwd)"
 LMMS_EVAL_ROOT="${LMMS_EVAL_ROOT:-${WORKSPACE_ROOT}/lmms-eval}"
+LMMS_EVAL_ROOT="$(cd "${LMMS_EVAL_ROOT}" && pwd)"
 VENV_PATH="${VENV_PATH:-${LLAVA_ROOT}/.venv_dynamic_prune_local}"
 PYTHON_VERSION="${PYTHON_VERSION:-3.10}"
 UV_BIN="${UV_BIN:-$(command -v uv || true)}"
